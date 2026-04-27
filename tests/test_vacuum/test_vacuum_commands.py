@@ -5,7 +5,10 @@ from typing import Any
 from unittest.mock import patch, MagicMock, AsyncMock, call
 
 from custom_components.robovac.robovac import RoboVac
-from custom_components.robovac.vacuum import RoboVacEntity
+from custom_components.robovac.vacuum import (
+    RoboVacEntity,
+    _build_dps152_room_clean_command,
+)
 
 
 @pytest.mark.asyncio
@@ -266,6 +269,79 @@ async def test_async_send_command(mock_robovac, mock_vacuum_data) -> None:
         entity._attr_boost_iq = True
         await entity.async_send_command("boostIQ")
         mock_robovac.async_set.assert_called_once_with({"118": False})
+
+
+def test_build_dps152_room_clean_command() -> None:
+    """Test DPS 152 room-clean payload encoding against known L60 payloads."""
+    assert (
+        _build_dps152_room_clean_command([1], map_id=3)
+        == "DggBIgoKBAgBEAEQARgD"
+    )
+    assert (
+        _build_dps152_room_clean_command([2], map_id=3)
+        == "DggBIgoKBAgCEAEQARgD"
+    )
+    assert (
+        _build_dps152_room_clean_command([1, 2], map_id=3)
+        == "FAgBIhAKBAgBEAEKBAgCEAIQARgD"
+    )
+
+
+@pytest.mark.asyncio
+async def test_async_send_command_room_clean_uses_json_payload_for_legacy_models(
+    mock_robovac,
+    mock_vacuum_data,
+) -> None:
+    """Test roomClean preserves the older DPS 124 JSON command path."""
+    with patch("custom_components.robovac.vacuum.RoboVac", return_value=mock_robovac):
+        entity = RoboVacEntity(mock_vacuum_data)
+
+        with patch("custom_components.robovac.vacuum.time.time", return_value=1234.567):
+            with patch(
+                "custom_components.robovac.vacuum.asyncio.sleep",
+                new_callable=AsyncMock,
+            ):
+                await entity.async_send_command(
+                    "roomClean",
+                    {"roomIds": [1, 2], "count": 2},
+                )
+
+    assert mock_robovac.async_set.await_args_list == [
+        call({
+            "124": (
+                "eyJtZXRob2QiOiJzZWxlY3RSb29tc0NsZWFuIiwiZGF0YSI6eyJyb29tSWRz"
+                "IjpbMSwyXSw"
+                "iY2xlYW5UaW1lcyI6Mn0sInRpbWVzdGFtcCI6MTIzNDU2N30="
+            )
+        }),
+        call({"2": True}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_async_send_command_room_clean_uses_dps152_protobuf_payload(
+    mock_l60_data,
+) -> None:
+    """Test roomClean uses DPS 152 protobuf payloads for L60/T2278-style models."""
+    with patch("custom_components.robovac.robovac.TuyaDevice.__init__", return_value=None):
+        robovac = RoboVac(
+            model_code="T2278",
+            device_id="test_id",
+            host="192.168.1.100",
+            local_key="test_key",
+        )
+
+    robovac.async_set = AsyncMock(return_value=True)
+
+    with patch("custom_components.robovac.vacuum.RoboVac", return_value=robovac):
+        entity = RoboVacEntity(mock_l60_data)
+
+        await entity.async_send_command(
+            "roomClean",
+            {"roomIds": 2, "count": 1, "mapId": 3},
+        )
+
+    robovac.async_set.assert_awaited_once_with({"152": "DggBIgoKBAgCEAEQARgD"})
 
 
 @pytest.mark.asyncio

@@ -76,6 +76,65 @@ UPDATE_RETRIES = 3
 VACUUM_ACTIVITY_VALUES = {activity.value for activity in VacuumActivity}
 
 
+def _encode_protobuf_varint(value: int) -> bytes:
+    """Encode an integer as a protobuf varint."""
+    encoded: list[int] = []
+    while True:
+        encoded.append(value & 0x7F)
+        value >>= 7
+        if not value:
+            break
+
+    for index in range(len(encoded) - 1):
+        encoded[index] |= 0x80
+
+    return bytes(encoded)
+
+
+def _encode_protobuf_field(field_number: int, value: int) -> bytes:
+    """Encode a protobuf varint field."""
+    return _encode_protobuf_varint(field_number << 3) + _encode_protobuf_varint(value)
+
+
+def _encode_protobuf_message(field_number: int, payload: bytes) -> bytes:
+    """Encode a length-delimited protobuf message field."""
+    tag = _encode_protobuf_varint((field_number << 3) | 2)
+    return tag + _encode_protobuf_varint(len(payload)) + payload
+
+
+def _build_dps152_room_clean_command(
+    room_ids: list[int],
+    clean_times: int = 1,
+    map_id: int = 1,
+) -> str:
+    """Build a DPS 152 SelectRoomsClean command payload.
+
+    L60/T2278-style models have been observed to use a length-prefixed
+    protobuf ModeCtrlRequest on DPS 152 for room cleaning. Older models keep
+    using the existing DPS 124 base64-encoded JSON command.
+
+    room_ids are the vacuum's map room identifiers. The nested room order
+    field is a one-based sequence for the requested cleaning order.
+    """
+    rooms = b"".join(
+        _encode_protobuf_message(
+            1,
+            _encode_protobuf_field(1, room_id) + _encode_protobuf_field(2, order),
+        )
+        for order, room_id in enumerate(room_ids, start=1)
+    )
+    select_rooms_clean = (
+        rooms
+        + _encode_protobuf_field(2, clean_times)
+        + _encode_protobuf_field(3, map_id)
+    )
+    request = (
+        _encode_protobuf_field(1, 1)
+        + _encode_protobuf_message(4, select_rooms_clean)
+    )
+    return base64.b64encode(_encode_protobuf_varint(len(request)) + request).decode()
+
+
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -922,9 +981,32 @@ class RoboVacEntity(StateVacuumEntity):
             await self.vacuum.async_set({
                 self.get_dps_code("BOOST_IQ"): new_value
             })
-        elif command in ("roomClean", "room_clean") and params is not None and isinstance(params, dict):
+        elif (
+            command in ("roomClean", "room_clean")
+            and params is not None
+            and isinstance(params, dict)
+        ):
             room_ids = params.get("roomIds") or params.get("room_ids", [1])
             count = params.get("count", 1)
+            if not isinstance(room_ids, list):
+                room_ids = [room_ids]
+
+            if self.get_dps_code("MODE") == "152":
+                map_id = params.get("mapId") or params.get("map_id", 1)
+                payload = _build_dps152_room_clean_command(
+                    [int(room_id) for room_id in room_ids],
+                    int(count),
+                    int(map_id),
+                )
+                _LOGGER.debug(
+                    "roomClean DPS 152 protobuf rooms=%s clean_times=%s map_id=%s",
+                    room_ids,
+                    count,
+                    map_id,
+                )
+                await self.vacuum.async_set({self.get_dps_code("MODE"): payload})
+                return
+
             clean_request = {"roomIds": room_ids, "cleanTimes": count}
             method_call = {
                 "method": "selectRoomsClean",
