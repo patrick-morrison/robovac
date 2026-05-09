@@ -273,7 +273,12 @@ class RoboVacEntity(StateVacuumEntity):
         return cls._encode_varint((field_num << 3) | 2) + cls._encode_varint(len(data)) + data
 
     @classmethod
-    def _build_protobuf_room_clean(cls, room_ids: list[int], clean_times: int = 1) -> str:
+    def _build_protobuf_room_clean(
+        cls,
+        room_ids: list[int],
+        clean_times: int = 1,
+        map_id: int | None = None,
+    ) -> str:
         """Build a ModeCtrlRequest protobuf to start room cleaning.
 
         The schema comes from the eufy-clean project's control.proto.
@@ -285,16 +290,19 @@ class RoboVacEntity(StateVacuumEntity):
         Args:
             room_ids: List of room IDs to clean.
             clean_times: Number of cleaning passes (default 1).
+            map_id: RoboVac map ID to clean from, when required by the model.
 
         Returns:
             Base64-encoded command string ready to send on DPS 152.
         """
         rooms_data = b""
-        for order, rid in enumerate(room_ids):
+        for order, rid in enumerate(room_ids, start=1):
             room_msg = cls._pb_field_varint(1, rid) + cls._pb_field_varint(2, order)
             rooms_data += cls._pb_field_bytes(1, room_msg)
 
         select_rooms = rooms_data + cls._pb_field_varint(2, clean_times)
+        if map_id is not None:
+            select_rooms += cls._pb_field_varint(3, map_id)
 
         mode_ctrl = cls._pb_field_varint(1, 1)       # START_SELECT_ROOMS_CLEAN
         mode_ctrl += cls._pb_field_bytes(4, select_rooms)
@@ -1002,6 +1010,7 @@ class RoboVacEntity(StateVacuumEntity):
 
             room_ids = params.get("roomIds") or params.get("room_ids", [1])
             count = params.get("count", 1)
+            map_id = params.get("mapId") or params.get("map_id")
             mode_dps = self.get_dps_code("MODE")
             auto_val = self.vacuum.getRoboVacCommandValue(RobovacCommand.MODE, "auto")
 
@@ -1009,8 +1018,8 @@ class RoboVacEntity(StateVacuumEntity):
             # ModeCtrlRequest on the MODE DPS code.  Legacy models use a
             # JSON payload on DPS 124 followed by a start command on DPS 2.
             if auto_val not in ("auto", "Auto") and mode_dps != TuyaCodes.ROOM_CLEAN:
-                proto_cmd = self._build_protobuf_room_clean(room_ids, count)
-                _LOGGER.debug("roomClean protobuf: room_ids=%s", room_ids)
+                proto_cmd = self._build_protobuf_room_clean(room_ids, count, map_id)
+                _LOGGER.debug("roomClean protobuf: room_ids=%s map_id=%s", room_ids, map_id)
                 await self.vacuum.async_set({mode_dps: proto_cmd})
             else:
                 clean_request = {"roomIds": room_ids, "cleanTimes": count}
